@@ -16,8 +16,11 @@ public:
   UsbCamNode() : Node("usb_cam_cpp"), system_clock_(RCL_SYSTEM_TIME) {
     // ---- Parameters
     device_       = declare_parameter<std::string>("device", "/dev/video0");
+    // Published size. 640x400 is a 2x scale of the OV9281's full 1280x800 sensor.
     width_        = declare_parameter<int>("width", 640);
-    height_       = declare_parameter<int>("height", 480);
+    height_       = declare_parameter<int>("height", 400);
+    capture_width_  = declare_parameter<int>("capture_width", 1280);
+    capture_height_ = declare_parameter<int>("capture_height", 800);
     fourcc_str_   = declare_parameter<std::string>("fourcc", "MJPG"); // MJPG, YUYV, Y800
     open_fps_     = declare_parameter<double>("open_fps", 100.0);     // request at camera
     target_fps_   = declare_parameter<double>("target_fps", 20.0);    // publish rate
@@ -45,8 +48,8 @@ public:
       fourcc_str_.size()>3?fourcc_str_[3]:'G'
     );
     cap_.set(cv::CAP_PROP_FOURCC, fourcc);
-    cap_.set(cv::CAP_PROP_FRAME_WIDTH,  width_);
-    cap_.set(cv::CAP_PROP_FRAME_HEIGHT, height_);
+    cap_.set(cv::CAP_PROP_FRAME_WIDTH,  capture_width_);
+    cap_.set(cv::CAP_PROP_FRAME_HEIGHT, capture_height_);
     cap_.set(cv::CAP_PROP_FPS, open_fps_);
     cap_.set(cv::CAP_PROP_BUFFERSIZE, buffers_);
 
@@ -55,8 +58,8 @@ public:
     const double ah = cap_.get(cv::CAP_PROP_FRAME_HEIGHT);
     const double afps = cap_.get(cv::CAP_PROP_FPS);
     RCLCPP_INFO(get_logger(),
-      "Opened %s as %.0fx%.0f %s, camera ~%.1f fps, publishing at %.1f Hz | buffers=%d | Δt(cam->imu)=%.6f s",
-      device_.c_str(), aw, ah, fourcc_str_.c_str(), afps, target_fps_, buffers_, timeshift_cam_imu_);
+      "Opened %s as %.0fx%.0f %s, publishing %dx%d, camera ~%.1f fps, publishing at %.1f Hz | buffers=%d | Δt(cam->imu)=%.6f s",
+      device_.c_str(), aw, ah, fourcc_str_.c_str(), width_, height_, afps, target_fps_, buffers_, timeshift_cam_imu_);
 
     // Publisher (sensor-data friendly)
     rclcpp::SensorDataQoS qos;
@@ -95,6 +98,10 @@ private:
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Failed to retrieve frame");
       return;
     }
+    // 640x480 is a different window of this sensor. Scale the full 1280x800 frame.
+    if (frame.cols != width_ || frame.rows != height_) {
+      cv::resize(frame, frame, cv::Size(width_, height_), 0, 0, cv::INTER_AREA);
+    }
 
     // Mid-exposure correction (optional) + Kalibr shift (once)
     if (use_mid_exposure_stamp_ && exposure_seconds_ > 0.0) {
@@ -123,7 +130,7 @@ private:
 
   // Params
   std::string device_, fourcc_str_, frame_id_;
-  int width_{640}, height_{480}, buffers_{1};
+  int width_{640}, height_{400}, capture_width_{1280}, capture_height_{800}, buffers_{1};
   double open_fps_{100.0}, target_fps_{20.0};
   bool grayscale_{true};
   double timeshift_cam_imu_{0.0};
