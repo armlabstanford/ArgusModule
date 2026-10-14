@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>argus_bmi270</name>
+  <version>0.0.1</version>
+  <description>BMI270 I2C driver that publishes sensor_msgs/Imu.</description>
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
