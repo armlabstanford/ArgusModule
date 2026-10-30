@@ -1,7 +1,12 @@
 // file: usb_cam_node.cpp
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <opencv2/opencv.hpp>
 
 #include "rclcpp/rclcpp.hpp"
@@ -26,6 +31,8 @@ public:
     target_fps_   = declare_parameter<double>("target_fps", 20.0);    // publish rate
     grayscale_    = declare_parameter<bool>("grayscale", true);       // mono8 vs bgr8
     frame_id_     = declare_parameter<std::string>("camera_frame_id", "cam0");
+    // Frames held while publish() is slow. 40 is 2 s at 20 Hz.
+    queue_size_   = static_cast<size_t>(std::max<int64_t>(1, declare_parameter<int>("queue_size", 40)));
 
     // Time alignment params
     timeshift_cam_imu_      = declare_parameter<double>("timeshift_cam_imu", 0.0); // added to cam stamp
@@ -58,8 +65,8 @@ public:
     const double ah = cap_.get(cv::CAP_PROP_FRAME_HEIGHT);
     const double afps = cap_.get(cv::CAP_PROP_FPS);
     RCLCPP_INFO(get_logger(),
-      "Opened %s as %.0fx%.0f %s, publishing %dx%d, camera ~%.1f fps, publishing at %.1f Hz | buffers=%d | Δt(cam->imu)=%.6f s",
-      device_.c_str(), aw, ah, fourcc_str_.c_str(), width_, height_, afps, target_fps_, buffers_, timeshift_cam_imu_);
+      "Opened %s as %.0fx%.0f %s, publishing %dx%d, camera ~%.1f fps, publishing at %.1f Hz | buffers=%d | queue=%zu | Δt(cam->imu)=%.6f s",
+      device_.c_str(), aw, ah, fourcc_str_.c_str(), width_, height_, afps, target_fps_, buffers_, queue_size_, timeshift_cam_imu_);
 
     // Publisher (sensor-data friendly)
     rclcpp::SensorDataQoS qos;
@@ -68,25 +75,80 @@ public:
     qos.durability_volatile();
     image_pub_ = this->create_publisher<sensor_msgs::msg::Image>("cam0/image_raw", qos);
 
-    // Timer for throttled publish
-    auto period = std::chrono::duration<double>(1.0 / std::max(0.1, target_fps_));
-    timer_ = this->create_wall_timer(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(period),
-      std::bind(&UsbCamNode::tick, this)
-    );
+    // Capture and publishing run on separate threads, so a slow publish()
+    // delays delivery instead of skipping frames.
+    publish_thread_ = std::thread([this]{ publishLoop(); });
+    capture_thread_ = std::thread([this]{ captureLoop(); });
   }
 
   ~UsbCamNode() override {
+    stop_ = true;
+    queue_cv_.notify_all();
+    if (capture_thread_.joinable()) capture_thread_.join();
+    if (publish_thread_.joinable()) publish_thread_.join();
     cap_.release();
   }
 
 private:
-  void tick() {
+  void captureLoop() {
+    using steady = std::chrono::steady_clock;
+    const auto period = std::chrono::duration_cast<steady::duration>(
+      std::chrono::duration<double>(1.0 / std::max(0.1, target_fps_)));
+    auto next_t = steady::now() + period;
+    while (!stop_) {
+      std::this_thread::sleep_until(next_t);
+      next_t += period;
+      // After a long stall, restart the schedule instead of grabbing back to back.
+      const auto now = steady::now();
+      if (next_t < now) next_t = now + period;
+      if (stop_) break;
+      auto msg = capture();
+      if (!msg) continue;
+
+      bool overflow = false;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (queue_.size() >= queue_size_) {
+          queue_.pop_front();
+          ++dropped_;
+          overflow = true;
+        }
+        queue_.push_back(std::move(msg));
+      }
+      queue_cv_.notify_one();
+      if (overflow) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "Camera queue full (%zu); %llu oldest frames dropped so far",
+          queue_size_, static_cast<unsigned long long>(dropped_.load()));
+      }
+    }
+  }
+
+  void publishLoop() {
+    while (true) {
+      sensor_msgs::msg::Image::UniquePtr msg;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait(lock, [this]{ return stop_ || !queue_.empty(); });
+        if (stop_) return;
+        msg = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      try {
+        image_pub_->publish(std::move(msg));
+      } catch (const std::exception & ex) {
+        if (!rclcpp::ok()) return;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Image publish failed: %s", ex.what());
+      }
+    }
+  }
+
+  sensor_msgs::msg::Image::UniquePtr capture() {
     // Stamp as close to dequeue as possible: midpoint around grab()
     const rclcpp::Time t_before = system_clock_.now();
     if (!cap_.grab()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Failed to grab frame");
-      return;
+      return nullptr;
     }
     const rclcpp::Time t_after = system_clock_.now();
 
@@ -96,7 +158,7 @@ private:
     cv::Mat frame;
     if (!cap_.retrieve(frame)) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Failed to retrieve frame");
-      return;
+      return nullptr;
     }
     // 640x480 is a different window of this sensor. Scale the full 1280x800 frame.
     if (frame.cols != width_ || frame.rows != height_) {
@@ -112,20 +174,20 @@ private:
     }
 
     // Convert to desired encoding
-    sensor_msgs::msg::Image::SharedPtr msg;
+    auto msg = std::make_unique<sensor_msgs::msg::Image>();
     if (grayscale_) {
       if (frame.channels() == 3)       cv::cvtColor(frame, frame, cv::COLOR_BGR2GRAY);
       else if (frame.channels() == 4)  cv::cvtColor(frame, frame, cv::COLOR_BGRA2GRAY);
-      msg = cv_bridge::CvImage({}, "mono8", frame).toImageMsg();
+      cv_bridge::CvImage({}, "mono8", frame).toImageMsg(*msg);
     } else {
       if (frame.channels() == 1)       cv::cvtColor(frame, frame, cv::COLOR_GRAY2BGR);
       else if (frame.channels() == 4)  cv::cvtColor(frame, frame, cv::COLOR_BGRA2BGR);
-      msg = cv_bridge::CvImage({}, "bgr8", frame).toImageMsg();
+      cv_bridge::CvImage({}, "bgr8", frame).toImageMsg(*msg);
     }
 
     msg->header.stamp = t_stamp;
     msg->header.frame_id = frame_id_;
-    image_pub_->publish(*msg);
+    return msg;
   }
 
   // Params
@@ -136,12 +198,20 @@ private:
   double timeshift_cam_imu_{0.0};
   double exposure_seconds_{0.0};
   bool   use_mid_exposure_stamp_{false};
+  size_t queue_size_{40};
 
   // State
   cv::VideoCapture cap_;
   rclcpp::Clock system_clock_;
-  rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
+
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::deque<sensor_msgs::msg::Image::UniquePtr> queue_;
+  std::atomic<uint64_t> dropped_{0};
+  std::atomic<bool> stop_{false};
+  std::thread capture_thread_;
+  std::thread publish_thread_;
 };
 
 int main(int argc, char** argv) {

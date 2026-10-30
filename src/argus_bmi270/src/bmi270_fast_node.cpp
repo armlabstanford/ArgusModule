@@ -5,9 +5,11 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <mutex>
 #include <stdexcept>
@@ -41,6 +43,8 @@ public:
     odr_hz_    = declare_parameter<double>("odr_hz", 200.0);           // IMU sampling target
     time_offset_ = declare_parameter<double>("time_offset", 0.0);      // add to IMU time (seconds)
     config_blob_path_ = declare_parameter<std::string>("config_bin_path", "");
+    // Samples held while publish() is slow. 2000 is 10 s at 200 Hz.
+    queue_size_ = static_cast<size_t>(std::max<int64_t>(1, declare_parameter<int>("queue_size", 2000)));
 
     // ---- Open I2C device
     fd_ = ::open(bus_path_.c_str(), O_RDWR);
@@ -56,10 +60,10 @@ public:
     acc_scale_ = (2.0 * kG) / 32768.0;                 // ±2g
     gyr_scale_ = (1000.0 * kPi / 180.0) / 32768.0;     // ±1000 dps -> rad/s
 
-    // ---- Publisher (SensorData QoS)
-    rclcpp::SensorDataQoS qos;
-    qos.keep_last(20);
-    qos.best_effort();
+    // ---- Publisher. Reliable, so OpenVINS's reliable IMU subscription
+    // connects; best-effort subscribers still match. 200 is 1 s at 200 Hz.
+    rclcpp::QoS qos(rclcpp::KeepLast(200));
+    qos.reliable();
     qos.durability_volatile();
     pub_ = create_publisher<sensor_msgs::msg::Imu>(topic_, qos);
 
@@ -85,17 +89,21 @@ public:
       0.0, 0.0, 1.6e-5
     };
 
-    // ---- Start read thread (publish on acquisition)
+    // ---- Sampling and publishing run on separate threads, so a slow
+    // publish() delays delivery instead of skipping samples.
+    publish_thread_ = std::thread([this]{ publishLoop(); });
     read_thread_ = std::thread([this]{ readLoop(); });
 
     RCLCPP_INFO(get_logger(),
-      "BMI270 fast node on %s addr=0x%02X → %s | ODR=%.0f Hz | frame_id=%s | time_offset=%.6f s",
-      bus_path_.c_str(), addr_, topic_.c_str(), odr_hz_, frame_id_.c_str(), time_offset_);
+      "BMI270 fast node on %s addr=0x%02X → %s | ODR=%.0f Hz | frame_id=%s | time_offset=%.6f s | queue=%zu",
+      bus_path_.c_str(), addr_, topic_.c_str(), odr_hz_, frame_id_.c_str(), time_offset_, queue_size_);
   }
 
   ~Bmi270FastNode() override {
     stop_ = true;
+    queue_cv_.notify_all();
     if (read_thread_.joinable()) read_thread_.join();
+    if (publish_thread_.joinable()) publish_thread_.join();
     if (fd_ >= 0) ::close(fd_);
   }
 
@@ -133,7 +141,7 @@ private:
       throw std::runtime_error("i2c rdwr read block failed");
   }
 
-  // ---- Read loop: acquire + stamp + publish immediately
+  // ---- Read loop: acquire + stamp + queue
   void readLoop() {
     using steady = std::chrono::steady_clock;
     const auto period_d = std::chrono::duration<double>(1.0 / std::max(1.0, odr_hz_));
@@ -165,7 +173,7 @@ private:
       const uint32_t nsec = static_cast<uint32_t>((t_mid - static_cast<double>(sec)) * 1e9);
       const rclcpp::Time t_ros(sec, nsec, RCL_SYSTEM_TIME);
 
-      // publish (copy prefilled covariances & frame_id)
+      // copy prefilled covariances & frame_id
       sensor_msgs::msg::Imu msg = base_msg_;
       msg.header.stamp = t_ros;
 
@@ -176,10 +184,44 @@ private:
       msg.angular_velocity.y    = gy * gyr_scale_;
       msg.angular_velocity.z    = gz * gyr_scale_;
 
-      pub_->publish(msg);
+      bool overflow = false;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (queue_.size() >= queue_size_) {
+          queue_.pop_front();
+          ++dropped_;
+          overflow = true;
+        }
+        queue_.push_back(std::move(msg));
+      }
+      queue_cv_.notify_one();
+      if (overflow) {
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "IMU queue full (%zu); %llu oldest samples dropped so far",
+          queue_size_, static_cast<unsigned long long>(dropped_.load()));
+      }
 
       next_t += period;
       std::this_thread::sleep_until(next_t);
+    }
+  }
+
+  void publishLoop() {
+    while (true) {
+      sensor_msgs::msg::Imu msg;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        queue_cv_.wait(lock, [this]{ return stop_ || !queue_.empty(); });
+        if (stop_) return;
+        msg = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      try {
+        pub_->publish(msg);
+      } catch (const std::exception & ex) {
+        if (!rclcpp::ok()) return;
+        RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "IMU publish failed: %s", ex.what());
+      }
     }
   }
 
@@ -188,6 +230,7 @@ private:
   uint8_t addr_{0x68};
   double odr_hz_{200.0};
   double time_offset_{0.0};
+  size_t queue_size_{2000};
 
   int fd_{-1};
   double acc_scale_{}, gyr_scale_{};
@@ -196,7 +239,13 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr pub_;
   sensor_msgs::msg::Imu base_msg_;
 
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::deque<sensor_msgs::msg::Imu> queue_;
+  std::atomic<uint64_t> dropped_{0};
+
   std::thread read_thread_;
+  std::thread publish_thread_;
   std::atomic<bool> stop_;
 };
 
